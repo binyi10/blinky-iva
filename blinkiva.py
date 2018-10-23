@@ -63,9 +63,13 @@ def blinkiva(X, U, n_src=None, sparse_reg=0., estimate_noise=False,
     # we will threshold entries of R and G that get to small
     machine_epsilon = np.finfo(float).eps
 
+    # we will only work with the blinky signal normalized by frequency
+    U_mean = U / n_freq
+
     I = np.eye(n_chan,n_chan)
     Y = np.zeros((n_frames, n_freq, n_chan), dtype=X.dtype)
     V = np.zeros((n_freq, n_chan, n_chan, n_chan), dtype=X.dtype)
+    P = np.zeros((n_frames, n_chan))
 
     # initialize the parts of NMF
     R_all = np.ones((n_frames, n_chan))
@@ -86,17 +90,10 @@ def blinkiva(X, U, n_src=None, sparse_reg=0., estimate_noise=False,
     if seed is not None:
         np.random.set_state(rng_state)
 
-
     if estimate_noise:
         zn = np.ones(n_blink) * np.min(U, axis=0)
     else:
         zn = np.zeros(n_blink)
-
-    '''
-    U_hat = np.dot(R, G)
-    norm_fact = np.linalg.norm(U_hat)
-    R *= np.linalg.norm(U) / np.linalg.norm(U_hat)
-    '''
 
     # Final normalization and demixing
     norm = np.mean(R, axis=0, keepdims=True)
@@ -109,6 +106,12 @@ def blinkiva(X, U, n_src=None, sparse_reg=0., estimate_noise=False,
         for f in range(n_freq):
             Y[:,f,:] = np.dot(X[:,f,:], np.conj(W[f,:,:]))
 
+    # initial demixing
+    demix(Y, X, W)
+    P[:,:] = np.linalg.norm(Y, axis=1) ** 2 / n_freq
+
+    P_norm = np.mean(P[:,:n_src], axis=0, keepdims=True)
+
     # NMF only
     for epoch in range(n_nmf_pre_iter):
 
@@ -116,15 +119,13 @@ def blinkiva(X, U, n_src=None, sparse_reg=0., estimate_noise=False,
         U_hat = np.dot(R, G) + zn[None,:]
         U_hat_I = 1. / U_hat
         R_I = 1. / R
-        #R *= np.sqrt( (P * R_I ** 2 + np.dot(U * U_hat_I ** 2, G.T)) / (n_freq * R_I + (n_freq - 1) * np.dot(U_hat_I, G.T)) )
         R *= np.sqrt( (np.dot(U * U_hat_I ** 2, G.T)) / (np.dot(U_hat_I, G.T) + sparse_reg) )
         R[R < machine_epsilon] = machine_epsilon
 
         # Update the gains
         U_hat = np.dot(R, G) + zn[None,:]
         U_hat_I = 1. / U_hat
-        #G *= np.sqrt( np.dot(R.T, U * U_hat_I ** 2) / ((n_freq - 1) * np.dot(R.T, U_hat_I)) )
-        G *= np.sqrt( np.dot(R.T, U * U_hat_I ** 2) / (np.dot(R.T, U_hat_I)) )
+        G *= np.sqrt( np.dot(R.T, U * U_hat_I ** 2) / np.dot(R.T, U_hat_I) )
         G[G < machine_epsilon] = machine_epsilon
 
         # Update noise gain
@@ -132,17 +133,11 @@ def blinkiva(X, U, n_src=None, sparse_reg=0., estimate_noise=False,
             zn *= np.sqrt( np.sum(U * U_hat_I ** 2, axis=0) / np.sum(U_hat_I, axis=0) )
 
         # enforce normalization of variables
-        norm = np.mean(R, axis=0, keepdims=True)
-        R /= norm
-        G *= norm.T
-        W[:,:,:n_src] /= np.sqrt(norm[None,:,:])
+        norm = P_norm / R.mean(axis=0, keepdims=True)
+        R *= norm
+        G /= norm.T
 
-
-    # NMF + IVA
-
-    # initial demixing
-    demix(Y, X, W)
-
+    # NMF + IVA joint updates
     for epoch in range(n_iter):
 
         if callback is not None and epoch % 10 == 0:
@@ -152,9 +147,8 @@ def blinkiva(X, U, n_src=None, sparse_reg=0., estimate_noise=False,
             else:
                 callback(Y, extra=[W,G,R,X,U])
 
-
         # compute activations for sources not tied to NMF
-        R_all[:,n_src:] = np.sqrt(np.sum(np.abs(Y[:,:,n_src:] * np.conj(Y[:,:,n_src:])), axis=1))
+        R_all[:,n_src:] = P[:,n_src:]
         
         # Compute Auxiliary Variable
         # shape: (n_freq, n_src, n_mic, n_mic)
@@ -180,14 +174,7 @@ def blinkiva(X, U, n_src=None, sparse_reg=0., estimate_noise=False,
 
         # The sources powers summed over frequencies
         # shape: (n_frames, n_src)
-        P = np.linalg.norm(Y[:,:,:n_src], axis=1)
-
-        # enforce normalization of variables
-        norm = 1. / np.sqrt(np.mean(np.abs(Y[:,:,:n_src]), axis=(0,1)))
-        P *= norm[None,:]
-        R *= norm[None,:]
-        G /= norm[:,None]
-        W[:,:,:n_src] *= norm[None,None,:]
+        P[:,:] = np.linalg.norm(Y, axis=1) ** 2 / n_freq
 
         if (epoch + 1) % n_iva_sub_iter != 0:
             continue
@@ -198,28 +185,21 @@ def blinkiva(X, U, n_src=None, sparse_reg=0., estimate_noise=False,
             U_hat = np.dot(R, G) + zn[None,:]
             U_hat_I = 1. / U_hat
             R_I = 1. / R
-            #R *= np.sqrt( (P * R_I ** 2 + np.dot(U * U_hat_I ** 2, G.T)) / (n_freq * R_I + (n_freq - 1) * np.dot(U_hat_I, G.T) + sparse_reg) )
-            R *= np.sqrt( (P * R_I ** 2 + np.dot(U * U_hat_I ** 2, G.T)) / (R_I + np.dot(U_hat_I, G.T) + sparse_reg) )
+            R *= np.sqrt(
+                    (P[:,:n_src] * R_I ** 2 + np.dot(U_mean * U_hat_I ** 2, G.T))
+                    / (R_I + np.dot(U_hat_I, G.T) + sparse_reg)
+                    )
             R[R < machine_epsilon] = machine_epsilon
 
             # Update the gains
             U_hat = np.dot(R, G) + zn[None,:]
             U_hat_I = 1. / U_hat
-            #G *= np.sqrt( np.dot(R.T, U * U_hat_I ** 2) / ((n_freq - 1) * np.dot(R.T, U_hat_I)) )
-            G *= np.sqrt( np.dot(R.T, U * U_hat_I ** 2) / (np.dot(R.T, U_hat_I)) )
+            G *= np.sqrt( np.dot(R.T, U_mean * U_hat_I ** 2) / np.dot(R.T, U_hat_I) )
             G[G < machine_epsilon] = machine_epsilon
 
             # Update noise gain
             if estimate_noise:
                 zn *= np.sqrt( np.sum(U * U_hat_I ** 2, axis=0) / np.sum(U_hat_I, axis=0) )
-
-
-    '''
-    norm = np.mean(R, axis=0, keepdims=True)
-    R /= norm
-    G *= norm.T
-    W[:,:,:n_src] /= np.sqrt(norm[None,:,:])
-    '''
 
     if proj_back:
         z = projection_back(Y, X[:,:,0])
